@@ -1,0 +1,6 @@
+# private data: your PRs, colleagues, repo names
+log.jsonl
+log.jsonl.bak-*
+.env
+
+__pycache__/

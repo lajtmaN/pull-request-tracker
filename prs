@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""prs — tracks my open PRs (authored + review-requested) and whose move it is.
+
+  prs               live board, re-syncs every PRS_INTERVAL s (default 60); one-shot when piped
+  prs    once       print the board, exit; syncs first only if the last sync is > PRS_MAX_AGE min
+                    (default 30) old, whoever did it. `once --force` always syncs
+  prs    show       print the board from the log only (no network)
+  prs    sync       sync only; prints one line per change
+  prs    log [N]    last N change events (default 20)
+  prs    test       self-check of the status rules
+
+The log (log.jsonl) is the source of truth; the board is a replay of it.
+See CLAUDE.md for the rules and the output format.
+"""
+from concurrent.futures import ThreadPoolExecutor
+import contextlib, fcntl, io, json, os, re, shutil, subprocess, sys, time, zlib
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.realpath(__file__))  # realpath: works via the ~/.local/bin symlink
+LOG = os.path.join(HERE, "log.jsonl")
+
+
+def load_env(path):
+    """KEY=VALUE lines from the git-ignored .env; real environment variables win."""
+    if os.path.exists(path):
+        for line in open(path):
+            key, sep, value = line.strip().partition("=")
+            if sep and not key.startswith("#"):
+                os.environ.setdefault(key.strip(), value.strip())
+
+
+load_env(os.path.join(HERE, ".env"))
+ORGS = [o for o in os.environ.get("PRS_ORGS", "").split(",") if o]  # empty: every org you can see
+
+PR_FIELDS = """
+fragment F on PullRequest {
+  id number title url updatedAt isDraft state mergeable reviewDecision
+  repository { nameWithOwner }
+  author { __typename login }
+  closingIssuesReferences(first: 3) { totalCount nodes { number title url repository { name } } }
+  reviewRequests(first: 20) { nodes { requestedReviewer {
+    __typename ... on User { login } ... on Team { slug } ... on Bot { login } } } }
+  commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+  timelineItems(last: 40, itemTypes: [PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT,
+      ISSUE_COMMENT, PULL_REQUEST_REVIEW, REVIEW_REQUESTED_EVENT, READY_FOR_REVIEW_EVENT]) {
+    nodes { __typename
+      ... on PullRequestCommit { url commit { committedDate author { user { login } } } }
+      ... on HeadRefForcePushedEvent { createdAt actor { __typename login } }
+      ... on IssueComment { url createdAt author { __typename login } }
+      ... on PullRequestReview { url submittedAt state author { __typename login } }
+      ... on ReviewRequestedEvent { createdAt actor { __typename login } }
+      ... on ReadyForReviewEvent { createdAt actor { __typename login } }
+    } }
+}"""
+
+
+def gql(query, **vars):
+    args = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for k, v in vars.items():
+        args += [x for i in v for x in ("-f", f"{k}[]={i}")] if isinstance(v, list) else ["-f", f"{k}={v}"]
+    return json.loads(subprocess.run(args, capture_output=True, text=True, check=True).stdout)["data"]
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def is_bot(actor):
+    return not actor or actor.get("__typename") == "Bot" or actor.get("login", "").endswith("[bot]")
+
+
+def events(pr):
+    """(time, login, kind, review_state, url) for human timeline events, oldest first."""
+    out = []
+    for n in pr["timelineItems"]["nodes"]:
+        t = n["__typename"]
+        if t == "PullRequestCommit":
+            u = (n["commit"]["author"] or {}).get("user")
+            out.append((n["commit"]["committedDate"], u and u["login"], "push", None, n.get("url")))
+        elif t == "PullRequestReview":
+            if n["state"] != "PENDING" and not is_bot(n["author"]):
+                out.append((n["submittedAt"], n["author"]["login"], "review", n["state"], n.get("url")))
+        else:
+            actor = n.get("actor") or n.get("author")
+            if not is_bot(actor):
+                kind = {"IssueComment": "comment", "HeadRefForcePushedEvent": "push",
+                        "ReadyForReviewEvent": "ready"}.get(t, "request")
+                out.append((n["createdAt"], actor["login"], kind, None, n.get("url")))
+    return sorted(out, key=lambda e: e[0])
+
+
+CI_WHY, CONFLICT_WHY, DRAFT_WHY = "fix failing CI", "resolve conflict", "finish draft"
+
+
+def ci_state(pr):
+    """SUCCESS / FAILURE / ERROR / PENDING / EXPECTED / None for the head commit's checks."""
+    return ((pr["commits"]["nodes"] or [{}])[0].get("commit", {}).get("statusCheckRollup") or {}).get("state")
+
+
+def status(pr, me):
+    """-> (role, wait, why). role A=author R=reviewer; wait ME|THEM.
+    why: under ME an instruction to me, under THEM '<who> to <verb>'."""
+    author = pr["author"]["login"]
+    pending = [r["requestedReviewer"].get("login") or r["requestedReviewer"].get("slug")
+               for r in pr["reviewRequests"]["nodes"] if r["requestedReviewer"]]
+    ev = events(pr)
+    talk = [e for e in ev if e[1] and e[2] in ("review", "comment", "push")]  # requests/ready ask nothing of anyone
+    checks = ci_state(pr)
+
+    if author == me:
+        if pr["isDraft"]:
+            return "A", "ME", DRAFT_WHY
+        if pr["mergeable"] == "CONFLICTING":
+            return "A", "ME", CONFLICT_WHY
+        if checks in ("FAILURE", "ERROR"):
+            return "A", "ME", CI_WHY
+        verdicts = {e[1]: e[3] for e in ev if e[1] != me and e[3] in ("APPROVED", "CHANGES_REQUESTED")}
+        approvers = [who for who, v in verdicts.items() if v == "APPROVED"]
+        if pr["reviewDecision"] == "APPROVED" or (  # repos without required reviews have no decision
+                pr["reviewDecision"] is None and approvers and "CHANGES_REQUESTED" not in verdicts.values()):
+            return "A", "ME", f"merge (approved by {', '.join(approvers)})" if approvers else "merge (approved)"
+        if talk and talk[-1][1] != me:
+            _, who, kind, st, _ = talk[-1]
+            if st == "CHANGES_REQUESTED":
+                return "A", "ME", f"address changes from {who}"
+            return "A", "ME", f"check commits from {who}" if kind == "push" else f"reply to {who}"
+        if pending:
+            return "A", "THEM", ", ".join(pending) + " to review"
+        others = sorted({e[1] for e in talk if e[1] != me})
+        if others:  # I answered their feedback and nobody is requested
+            return "A", "THEM", ", ".join(others) + " to re-review"
+        return "A", "ME", "request review"
+
+    if pr["isDraft"]:
+        return "R", "THEM", f"{author} to {DRAFT_WHY}"
+    if me in pending:
+        return "R", "ME", f"review (asked by {author})"
+    mine = [e for e in ev if e[1] == me and e[2] == "review"]
+    newer = [e for e in talk if mine and e[0] > mine[-1][0] and e[1] == author]
+    if newer:
+        return "R", "ME", f"reply to {author}" if newer[-1][2] == "comment" else f"re-review ({author} pushed)"
+    verdict = mine[-1][3] if mine else None
+    return "R", "THEM", {"APPROVED": f"{author} to merge (you approved)",
+                         "CHANGES_REQUESTED": f"{author} to address your review",
+                         "COMMENTED": f"{author} to reply to you"}.get(verdict, f"{author} to act (not your review)")
+
+
+def linked_issue(pr):
+    """The issue in the PR's Development section, as {key, title, url, more}; None if unlinked."""
+    refs = pr["closingIssuesReferences"]
+    if not refs["nodes"]:
+        return None
+    n = refs["nodes"][0]
+    return {"key": f"{n['repository']['name']}#{n['number']}", "title": n["title"], "url": n["url"],
+            "more": refs["totalCount"] - 1}
+
+
+def issue_text(issue, width):
+    if not issue:
+        return "—"
+    text = f"{short(issue['key'])}: {issue['title']}" + (f" (+{issue['more']})" if issue["more"] else "")
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def fetch(me):
+    q = "query($q:String!){search(query:$q,type:ISSUE,first:100){nodes{...F}}}" + PR_FIELDS
+    orgs = " ".join(f"org:{o}" for o in ORGS)
+    filters = (f"author:{me}", f"review-requested:{me}", f"reviewed-by:{me} -author:{me}")
+    with ThreadPoolExecutor() as pool:  # each search is a separate gh call, ~2-4s each
+        results = pool.map(lambda f: gql(q, q=f"is:pr is:open {orgs} {f}")["search"]["nodes"], filters)
+    return {n["id"]: n for nodes in results for n in nodes}
+
+
+WORDING = 3  # bump when status texts change; the next sync logs the rewording as hidden 'reworded' lines
+
+
+def last_wording():
+    lines = open(LOG).readlines() if os.path.exists(LOG) else []
+    syncs = [json.loads(l) for l in lines if '"ev": "sync"' in l]
+    return syncs[-1].get("wording", 1) if syncs else WORDING
+
+
+def visible(e):
+    """Log events worth showing as a change (not heartbeats, not pure rewording)."""
+    return e["ev"] != "sync" and e["f"].get("type") not in ("reworded", "backfill", "CI started")  # pushes start CI
+
+
+def replay():
+    board, last_sync = {}, None
+    if os.path.exists(LOG):
+        for line in open(LOG):
+            e = json.loads(line)
+            if e["ev"] == "sync":
+                last_sync = e["ts"]
+            elif e["ev"] == "gone":
+                board.pop(e["id"], None)
+            else:
+                cur = board.setdefault(e["id"], {})
+                cur.update(e["f"], key=e["key"])
+    return board, last_sync
+
+
+def sync():
+    me = os.environ.get("PRS_ME") or gql("{viewer{login}}")["viewer"]["login"]
+    live = fetch(me)
+    with open(LOG, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)  # live view, /prs and the monitor may sync at the same time
+        out = diff_live(me, live)
+        fh.writelines(json.dumps(e) + "\n" for e in out)
+    return out[:-1]
+
+
+def diff_live(me, live):
+    """Log events that turn the replayed board into the live one. Caller holds the log lock."""
+    board, _ = replay()
+    reword = last_wording() != WORDING
+    ts, out = now(), []
+    for pid, pr in live.items():
+        role, wait, why = status(pr, me)
+        ev = events(pr)
+        snap = {"title": pr["title"], "url": pr["url"], "role": role, "wait": wait, "why": why,
+                "at": ev[-1][0] if ev else pr["updatedAt"],  # last human activity
+                "issue": linked_issue(pr), "author": pr["author"]["login"], "ci": ci_state(pr)}
+        old = board.get(pid, {})
+        if pr["mergeable"] == "UNKNOWN" and old.get("why") == CONFLICT_WHY:  # GitHub still recomputing: no flip
+            snap["wait"], snap["why"] = old["wait"], old["why"]
+        diff = {k: v for k, v in snap.items() if old.get(k) != v}
+        if "at" in diff and ev[-1:] and ev[-1][2] in ("review", "comment"):
+            diff["link"] = ev[-1][4]  # the review/comment that caused this change
+        if diff:
+            known = pid in board
+            silent = {k for k in diff if k not in old} | ({"why"} if reword else set())
+            if known and set(diff) <= silent:  # a prs upgrade reworded texts or added fields: log quietly
+                diff["type"] = "reworded" if "why" in diff else "backfill"
+            else:
+                diff["type"] = change_type(known, diff, ev, snap, old)
+                diff["by"] = change_by(known, diff, ev, snap, old, pr["author"]["login"], me)
+            diff.setdefault("wait", wait)  # every line carries the resulting state
+            diff.setdefault("why", why)
+            out.append({"ts": ts, "ev": "set", "id": pid,
+                        "key": f"{pr['repository']['nameWithOwner'].split('/')[1]}#{pr['number']}", "f": diff})
+    gone = [pid for pid in board if pid not in live]
+    if gone:  # learn why it left: merged / closed / no longer involves me
+        q = """query($ids:[ID!]!){nodes(ids:$ids){...on PullRequest{state mergedBy{login}
+               timelineItems(last:1,itemTypes:[CLOSED_EVENT]){nodes{...on ClosedEvent{actor{login}}}}}}}"""
+        for pid, n in zip(gone, gql(q, ids=gone)["nodes"]):
+            n = n or {"state": "DELETED"}
+            closer = (n.get("mergedBy") or ((n.get("timelineItems") or {}).get("nodes") or [{}])[-1].get("actor") or {}).get("login")
+            out.append({"ts": ts, "ev": "gone", "id": pid, "key": board[pid]["key"],
+                        "f": {"why": n["state"].lower() if n["state"] != "OPEN" else "untracked",
+                              "by": ("me" if closer == me else closer) if n["state"] != "OPEN" and closer else "—"}})
+    out.append({"ts": ts, "ev": "sync", "n": len(live), "wording": WORDING})
+    return out
+
+
+REVIEW_TYPES = {"APPROVED": "approved", "CHANGES_REQUESTED": "changes req", "COMMENTED": "commented",
+                "DISMISSED": "dismissed"}
+EVENT_TYPES = {"push": "pushed", "comment": "commented", "request": "requested", "ready": "ready"}
+ENTER_TYPES = {CI_WHY: "CI failed", CONFLICT_WHY: "conflict", DRAFT_WHY: "draft"}  # board state began
+LEAVE_TYPES = {CONFLICT_WHY: "no conflict", DRAFT_WHY: "ready"}                   # board state ended
+
+
+def change_type(known, diff, ev, snap, old):
+    """What kind of change this is, for the 'recent changes' type column."""
+    if not known and snap["role"] == "A":
+        return "opened"
+    if set(diff) == {"issue"}:
+        return "linked" if snap["issue"] else "unlinked"
+    if set(diff) == {"ci"}:  # checks finished or (re)started, the board status didn't move
+        return {"SUCCESS": "CI passed", "FAILURE": "CI failed", "ERROR": "CI failed"}.get(snap["ci"], "CI started")
+    if not known and not ev:
+        return "review req" if snap["wait"] == "ME" else "tracked"
+    if ("at" in diff or not known) and ev:  # new activity on the PR caused it
+        _, _, kind, st, _ = ev[-1]
+        return REVIEW_TYPES.get(st, "review") if kind == "review" else EVENT_TYPES[kind]
+    if "why" in diff:
+        if snap["why"] in ENTER_TYPES:
+            return ENTER_TYPES[snap["why"]]
+        if old.get("why") == CI_WHY:  # failed checks went away: fixed, or just re-running
+            return "CI fixed" if snap.get("ci") == "SUCCESS" else "CI running"
+        if old.get("why") in LEAVE_TYPES:
+            return LEAVE_TYPES[old["why"]]
+        return "draft" if snap["why"].endswith(DRAFT_WHY) else "changed"
+    return "retitled" if "title" in diff else "changed"
+
+
+TYPE_COLORS = {"32": ("approved", "merged", "CI fixed", "CI passed", "no conflict"), "31": ("changes req", "CI failed", "conflict"),
+               "33": ("commented", "comment", "review", "dismissed"), "36": ("requested", "opened", "ready", "linked"),
+               "34": ("pushed",)}  # green, red, yellow, cyan, blue; anything else is dim
+TYPE_COLOR = {t: c for c, ts in TYPE_COLORS.items() for t in ts}
+
+
+def change_by(known, diff, ev, snap, old, author, me):
+    """Who caused this change: a login, 'me', 'github' (CI/conflicts) or '—'."""
+    whys = (snap["why"], old.get("why"))
+    if ("at" in diff or not known) and ev:
+        who = ev[-1][1]
+    elif CI_WHY in whys or CONFLICT_WHY in whys or set(diff) == {"ci"}:
+        return "github"
+    elif DRAFT_WHY in whys or "title" in diff:
+        who = author
+    else:
+        return "—"
+    return "me" if who == me else who or "—"
+
+
+def secs_since(ts):
+    return (datetime.now(timezone.utc) - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds()
+
+
+def age(ts):
+    s = secs_since(ts)
+    if s < 60:
+        return f"{int(s)}s"
+    return f"{int(s // 60)}m" if s < 3600 else f"{int(s // 3600)}h" if s < 86400 else f"{int(s // 86400)}d"
+
+
+def short(key):
+    return key.removeprefix(os.environ.get("PRS_STRIP_PREFIX", ""))  # e.g. a shared repo-name prefix
+
+
+def link(url, text):
+    """OSC 8 hyperlink: clickable in terminals that support it."""
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\" if url else text
+
+
+def when(e):
+    """When the change happened: the GitHub event's time if an event caused it, else when the sync saw it."""
+    f = e["f"]
+    caused_by_event = f.get("type") in {*REVIEW_TYPES.values(), *EVENT_TYPES.values()}
+    return f["at"] if e["ev"] == "set" and "at" in f and caused_by_event else e["ts"]
+
+
+def next_step(why):
+    """Board text minus its reason; the type/by columns already say why ('merge it, approved by x' -> 'merge it')."""
+    return re.sub(r" \(.*\)$", "", why)
+
+
+def fmt_change(e, urls=None):
+    """One recent-changes line: when · PR · type (what happened) · by (who) · next step it left the PR on.
+    urls: PR id -> url; when given (live mode) the line is colored and links to the review/comment or the PR."""
+    f = e["f"]
+    if e["ev"] == "gone":
+        typ = f["why"]
+        what = "no longer involves you" if typ == "untracked" else ""  # merged/closed: the type says it all
+    else:
+        typ = f["type"]
+        what = ("you to " if f["wait"] == "ME" else "") + next_step(f["why"])  # the NEXT column
+    by = f.get("by", "—")
+    by = "you" if by == "me" else by
+    live = urls is not None
+    col = paint(f"{typ:<11}", TYPE_COLOR.get(typ, "2"), live)
+    who = paint(f"{by[:14]:<14}", person_color(by), live)
+    what = paint(what, ME_COLOR if f.get("wait") == "ME" and e["ev"] == "set" else "", live)
+    ago = paint(f"{age(when(e)) + ' ago':>7}", age_color(when(e)), live)
+    line = f"{ago}  {short(e['key']):<26} {col}  {who} {what}".rstrip()
+    return link(f.get("link") or urls.get(e["id"]), line) if urls is not None else line
+
+
+CHANGE_COLS = f"{'WHEN':>7}  {'PR':<26} {'TYPE':<11}  {'BY':<14} NEXT"  # header for fmt_change lines
+
+
+# 256-color mid tones that read on dark and light backgrounds; used for issues and people
+PALETTE = ["38;5;33", "38;5;71", "38;5;166", "38;5;98", "38;5;37", "38;5;168",
+           "38;5;136", "38;5;62", "38;5;127", "38;5;30", "38;5;130", "38;5;94"]
+ME_COLOR, THEM_COLOR = "1;33", "36"  # bold yellow = your move, cyan = theirs
+
+
+def paint(text, code, live=True):
+    """ANSI color in the live view only; pad text before painting, escapes have no width."""
+    return f"\033[{code}m{text}\033[0m" if live and code else text
+
+
+def dim(text, live):
+    """Column headers: dimmed in the live view, plain text elsewhere."""
+    return paint(text, "2", live)
+
+
+def age_color(ts):
+    s = secs_since(ts)
+    return "32" if s < 86400 else "33" if s < 7 * 86400 else "31"  # <1d green, <1w yellow, older red
+
+
+def person_color(who):
+    return "2" if who in ("me", "you", "github", "—") else PALETTE[zlib.crc32(who.encode()) % len(PALETTE)]
+
+
+def show(live=False):
+    """live: rows are links and title + issue share the terminal width; else fixed widths (stable format)."""
+    board, last = replay()
+    free = shutil.get_terminal_size().columns - 84  # 82 before the title, 2 between title and issue
+    tw, iw = (max(20, free * 3 // 5), max(20, free - max(20, free * 3 // 5))) if live else (50, 35)  # title gets more
+    rows = sorted(board.values(), key=lambda r: r["at"], reverse=True)  # newest activity first
+    me = [r for r in rows if r["wait"] == "ME"]
+    them = [r for r in rows if r["wait"] == "THEM"]
+    # distinct colors per issue; sorted keys keep them stable while the set of issues is unchanged
+    keys = sorted({r["issue"]["key"] for r in rows if r.get("issue")})
+    issue_color = {k: PALETTE[i % len(PALETTE)] for i, k in enumerate(keys)}
+    for label, grp, color in (("YOUR MOVE", me, ME_COLOR), ("THEIR MOVE", them, THEM_COLOR)):
+        if grp is them:
+            print()
+        print(paint(f"{f'{label} ({len(grp)})':<28}", color, live) +  # at the left edge; rows are indented by 2
+              dim(f" {'WHOSE PR':<13} {'AGE':>3}  {'STATUS':<32}  {'TITLE':<{tw}}  ISSUE", live))
+        for r in grp or [None]:
+            if not r:
+                print("  —")
+                continue
+            title = r["title"] if len(r["title"]) <= tw else r["title"][:tw - 1] + "…"
+            whose = "mine" if r["role"] == "A" else r.get("author", "?")
+            whose = paint(f"{whose[:13]:<13}", "" if r["role"] == "A" else person_color(whose), live)
+            ago = paint(f"{age(r['at']):>3}", age_color(r["at"]), live)
+            why = r["why"] if len(r["why"]) <= 32 else r["why"][:31] + "…"
+            why = paint(f"{why:<32}", "1" if r["wait"] == "ME" else "", live)
+            row = f"{short(r['key']):<26} {whose} {ago}  {why}  {title:<{tw}}"
+            issue = r.get("issue")
+            itext = paint(issue_text(issue, iw), issue_color[issue["key"]] if issue else "2", live)
+            print(f"  {link(r['url'], row)}  {link((issue or {}).get('url'), itext)}" if live
+                  else f"  {row}  {itext}".rstrip())
+    if not live:  # the live view puts this in its footer
+        print(f"\n{synced_text(last)}")
+
+
+def synced_text(last):
+    return f"synced {age(last) + ' ago' if last else 'never'}"
+
+def test():
+    me = "me"
+    def pr(author="me", draft=False, reqs=(), tl=(), decision=None, checks="SUCCESS", mergeable="MERGEABLE"):
+        return {"author": {"login": author, "__typename": "User"}, "isDraft": draft, "mergeable": mergeable,
+                "reviewDecision": decision,
+                "reviewRequests": {"nodes": [{"requestedReviewer": {"__typename": "User", "login": r}} for r in reqs]},
+                "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": checks}}}]},
+                "timelineItems": {"nodes": list(tl)}}
+    push = lambda t, who: {"__typename": "PullRequestCommit", "commit": {"committedDate": t, "author": {"user": {"login": who}}}}
+    rev = lambda t, who, st: {"__typename": "PullRequestReview", "submittedAt": t, "state": st, "author": {"__typename": "User", "login": who}}
+    com = lambda t, who, typ="User": {"__typename": "IssueComment", "createdAt": t, "author": {"__typename": typ, "login": who}}
+    cases = [
+        (pr(draft=True), ("A", "ME", "finish draft")),
+        (pr(checks="FAILURE", reqs=["x"]), ("A", "ME", "fix failing CI")),
+        (pr(mergeable="CONFLICTING"), ("A", "ME", "resolve conflict")),
+        (pr(decision="APPROVED"), ("A", "ME", "merge (approved)")),
+        (pr(tl=[push("1", "me")]), ("A", "ME", "request review")),
+        (pr(tl=[push("1", "me"), rev("2", "x", "APPROVED")]), ("A", "ME", "merge (approved by x)")),
+        (pr(decision="REVIEW_REQUIRED", reqs=["y"], tl=[push("1", "me"), rev("2", "x", "APPROVED"), push("3", "me")]),
+         ("A", "THEM", "y to review")),
+        (pr(reqs=["x"], tl=[push("1", "me")]), ("A", "THEM", "x to review")),
+        (pr(tl=[push("1", "me"), rev("2", "x", "CHANGES_REQUESTED")]), ("A", "ME", "address changes from x")),
+        (pr(tl=[push("1", "me"), com("2", "x")]), ("A", "ME", "reply to x")),
+        (pr(tl=[push("1", "me"), push("2", "x")]), ("A", "ME", "check commits from x")),
+        (pr(reqs=["x"], tl=[push("1", "me"), com("2", "ci", "Bot")]), ("A", "THEM", "x to review")),
+        (pr(tl=[rev("2", "x", "COMMENTED"), push("3", "me")]), ("A", "THEM", "x to re-review")),
+        (pr("bob", reqs=["me"]), ("R", "ME", "review (asked by bob)")),
+        (pr("bob", tl=[rev("2", "me", "CHANGES_REQUESTED"), push("3", "bob")]), ("R", "ME", "re-review (bob pushed)")),
+        (pr("bob", tl=[rev("2", "me", "COMMENTED"), com("3", "bob")]), ("R", "ME", "reply to bob")),
+        (pr("bob", tl=[push("1", "bob"), rev("2", "me", "APPROVED")]), ("R", "THEM", "bob to merge (you approved)")),
+        (pr("bob", tl=[push("1", "bob"), rev("2", "me", "CHANGES_REQUESTED")]), ("R", "THEM", "bob to address your review")),
+        (pr("bob", tl=[push("1", "bob")]), ("R", "THEM", "bob to act (not your review)")),
+        (pr("bob", draft=True, reqs=["me"]), ("R", "THEM", "bob to finish draft")),
+    ]
+    for i, (p, want) in enumerate(cases):
+        got = status(p, me)
+        assert got == want, f"case {i}: {got} != {want}"
+    E = lambda kind, st=None: [("1", "x", kind, st, None)]
+    snap = {"role": "A", "wait": "THEM", "why": "x to review", "ci": "SUCCESS"}
+    checks = 0
+    for args, want in [((False, {}, [], snap, {}), "opened"),
+                       ((False, {"at": 1}, E("review", "APPROVED"), {**snap, "role": "R"}, {}), "approved"),
+                       ((True, {"at": 1}, E("review", "CHANGES_REQUESTED"), snap, {}), "changes req"),
+                       ((True, {"at": 1}, E("request"), snap, {}), "requested"),
+                       ((True, {"at": 1}, E("comment"), snap, {}), "commented"),
+                       ((True, {"why": 1}, [], {**snap, "why": CI_WHY}, {}), "CI failed"),
+                       ((True, {"why": 1}, [], snap, {"why": CI_WHY}), "CI fixed"),
+                       ((True, {"why": 1}, [], {**snap, "ci": "PENDING"}, {"why": CI_WHY}), "CI running"),
+                       ((True, {"why": 1}, [], snap, {"why": CONFLICT_WHY}), "no conflict"),
+                       ((True, {"title": 1}, [], snap, {}), "retitled"),
+                       ((True, {"ci": 1}, [], snap, {}), "CI passed"),
+                       ((True, {"ci": 1}, [], {**snap, "ci": "PENDING"}, {}), "CI started")]:
+        assert change_type(*args) == want, (args, change_type(*args)); checks += 1
+    for got, want in [
+            (change_by(True, {"at": 1}, [("1", "bob", "review", "APPROVED", None)], snap, {}, "me", "me"), "bob"),
+            (change_by(True, {"at": 1}, [("1", "me", "push", None, None)], snap, {}, "me", "me"), "me"),
+            (change_by(True, {"why": 1}, [], snap, {"why": CI_WHY}, "me", "me"), "github"),
+            (change_by(True, {"ci": 1}, [], snap, {}, "me", "me"), "github"),
+            (visible({"ev": "set", "f": {"type": "reworded"}}), False),
+            (visible({"ev": "set", "f": {"type": "backfill"}}), False)]:
+        assert got == want, (got, want); checks += 1
+    ev = {"ts": now(), "ev": "set", "id": "x", "key": "a#1",
+          "f": {"wait": "THEM", "why": "x, y to review", "type": "requested", "by": "me"}}
+    assert fmt_change(ev).endswith("requested    you            x, y to review"), fmt_change(ev)
+    ev["f"].update(wait="ME", why=CI_WHY, type="CI failed", by="github")
+    assert fmt_change(ev).endswith("CI failed    github         you to fix failing CI"), fmt_change(ev)
+    checks += 2
+    for why, want in [("merge (approved by x)", "merge"), ("bob to merge (you approved)", "bob to merge"),
+                      ("review (asked by bob)", "review"), ("re-review (bob pushed)", "re-review"),
+                      ("x, y to review", "x, y to review"), ("address changes from x", "address changes from x")]:
+        assert next_step(why) == want, (why, next_step(why)); checks += 1
+    iss = {"key": "web-app#743", "title": "Add a dark mode toggle", "url": "u", "more": 0}
+    assert issue_text(iss, 60) == "web-app#743: Add a dark mode toggle"
+    assert issue_text(iss, 20) == "web-app#743: Add a …" and issue_text(None, 20) == "—"
+    assert issue_text({**iss, "more": 1}, 60).endswith("toggle (+1)")
+    assert change_type(True, {"issue": 1}, [], {**snap, "issue": iss}, {}) == "linked"
+    checks += 4
+    print(f"ok {len(cases)} status cases + {checks} helper checks")
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "board"
+    if cmd == "test":
+        test()
+    elif cmd == "show":
+        show()
+    elif cmd == "log":
+        lines = [json.loads(l) for l in open(LOG)] if os.path.exists(LOG) else []
+        print(CHANGE_COLS)
+        for e in sorted([e for e in lines if visible(e)][-int(sys.argv[2] if len(sys.argv) > 2 else 20):], key=when, reverse=True):
+            print(fmt_change(e))
+    elif cmd == "sync":
+        for e in filter(visible, sync()):
+            print(fmt_change(e))
+    elif cmd == "once" or not sys.stdout.isatty():  # piped / /prs skill: one shot
+        # reuse the last sync by anyone (e.g. a live view) unless it is older than PRS_MAX_AGE minutes
+        _, last = replay()
+        if "--force" in sys.argv or not last or secs_since(last) > 60 * int(os.environ.get("PRS_MAX_AGE", "30")):
+            sync()
+        show()
+    else:  # terminal: live board like top, Ctrl-C to quit
+        interval = int(os.environ.get("PRS_INTERVAL", "60"))
+        def render(status):
+            buf = io.StringIO()  # render off-screen, then write once so the redraw doesn't flicker
+            with contextlib.redirect_stdout(buf):
+                show(live=True)
+                print("\n" + paint("RECENT CHANGES", "1"))
+                print("  " + dim(CHANGE_COLS, True))
+                lines = open(LOG).readlines() if os.path.exists(LOG) else []
+                changes = [e for e in map(json.loads, lines) if visible(e)]
+                urls = {e["id"]: e["f"]["url"] for e in changes if "url" in e["f"]}  # also covers gone PRs
+                for e in sorted(changes[-5:], key=when, reverse=True):  # newest first
+                    print("  " + fmt_change(e, urls))
+                print(f"\n{synced_text(replay()[1])} · {status} · Ctrl-C to quit")
+            # overwrite in place: home, each line cleared to its end, then clear below (no scrollback growth)
+            sys.stdout.write("\033[H" + buf.getvalue().replace("\n", "\033[K\n") + "\033[K\033[J")
+            sys.stdout.flush()
+
+        sys.stdout.write("\033[?1049h\033[?25l")  # alternate screen like top/less, hide cursor
+        try:
+            _, last = replay()  # reuse a sync younger than one interval, e.g. from another live view
+            err, next_sync = None, (time.time() - secs_since(last) + interval) if last else 0
+            src = os.path.realpath(__file__)
+            started = os.path.getmtime(src)
+            while True:
+                if os.path.getmtime(src) != started:  # script was edited: restart on the new code
+                    os.execv(sys.executable, [sys.executable, src] + sys.argv[1:])
+                if time.time() >= next_sync:
+                    render("syncing with GitHub…")  # last known board shows instantly while gh runs
+                    try:
+                        sync()
+                        err = None
+                    except Exception as ex:  # network blip: keep showing the last known board
+                        err = ex
+                    next_sync = time.time() + interval
+                wait_s = int(next_sync - time.time())
+                render(f"sync failed, retry in {wait_s}s: {str(err)[:60]}" if err
+                       else f"next sync in {wait_s}s (every {interval}s)")
+                time.sleep(5)  # redraw from the log every 5s so the ages tick
+        except KeyboardInterrupt:
+            pass
+        finally:  # back to the normal screen, exactly as it was before prs started
+            sys.stdout.write("\033[?25h\033[?1049l")
+            sys.stdout.flush()
