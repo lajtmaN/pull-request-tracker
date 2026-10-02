@@ -533,11 +533,12 @@ if __name__ == "__main__":
                 lines = open(LOG).readlines() if os.path.exists(LOG) else []
                 changes = [e for e in map(json.loads, lines) if visible(e)]
                 urls = {e["id"]: e["f"]["url"] for e in changes if "url" in e["f"]}  # also covers gone PRs
-                for e in sorted(changes[-5:], key=when, reverse=True):  # newest first
+                for e in sorted(changes[-10:], key=when, reverse=True):  # last 10, newest first
                     print("  " + fmt_change(e, urls))
                 print(f"\n{synced_text(replay()[1])} · {status} · Ctrl-C to quit")
             # overwrite in place: home, each line cleared to its end, then clear below (no scrollback growth)
-            sys.stdout.write("\033[H" + buf.getvalue().replace("\n", "\033[K\n") + "\033[K\033[J")
+            screen = buf.getvalue().rstrip("\n")  # no newline after the footer: it would leave an empty last line
+            sys.stdout.write("\033[H" + screen.replace("\n", "\033[K\n") + "\033[K\033[J")
             sys.stdout.flush()
 
         sys.stdout.write("\033[?1049h\033[?25l")  # alternate screen like top/less, hide cursor
