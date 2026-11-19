@@ -7,7 +7,7 @@ review was requested from them or they have reviewed. Settings live in the git-i
 ## Files
 - `prs` — the CLI (symlink it onto your PATH). Bare `prs` = live board. `once`, `show` (offline), `sync`, `log [N]`, `test`.
 - `log.jsonl` — append-only change log, the **source of truth**. One JSON object per line:
-  - `{"ev":"set","id","key","ts","f":{changed fields}}` fields: title url role wait why at issue author ci type by link (type = kind of change, link = the review/comment that caused it)
+  - `{"ev":"set","id","key","ts","f":{changed fields}}` fields: title url role wait why at issue author ci team type by link (type = kind of change, link = the review/comment that caused it, team = only a team review request involves me)
   - `{"ev":"gone","id","key","ts","f":{"why":"merged|closed|untracked"}}`
   - `{"ev":"sync","ts","n"}` heartbeat
   The board is a replay of this log. Never edit or truncate it by hand unless the user explicitly asks
@@ -18,6 +18,7 @@ review was requested from them or they have reviewed. Settings live in the git-i
 Sections: YOUR MOVE (n) and THEIR MOVE (n), each with its own column header row; "synced … ago" is the last line (live: in the footer):
 PR · WHOSE PR (`mine` or the author) · AGE (since last human activity) · STATUS (≤32 chars, cut with …) ·
 TITLE · ISSUE (the PR's Development-section issue, `—` if none). Rows newest activity first.
+PRs with `team` set are hidden while `PRS_TEAM_REVIEWS=0` (live view: `t` toggles it, footer shows it). Live view: Enter syncs now.
 
 ## Status rules (the `status()` function, run `prs test` after changing it)
 STATUS text: under YOUR MOVE an instruction to the user, under THEIR MOVE "<who> to <verb>"; reasons go in

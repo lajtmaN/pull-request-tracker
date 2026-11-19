@@ -31,6 +31,7 @@ def load_env(path):
 
 load_env(os.path.join(HERE, ".env"))
 ORGS = [o for o in os.environ.get("PRS_ORGS", "").split(",") if o]  # empty: every org you can see
+TEAMS = os.environ.get("PRS_TEAM_REVIEWS", "1") != "0"  # 0: hide PRs that only involve me via a team review request
 
 PR_FIELDS = """
 fragment F on PullRequest {
@@ -165,10 +166,13 @@ def issue_text(issue, width):
 def fetch(me):
     q = "query($q:String!){search(query:$q,type:ISSUE,first:100){nodes{...F}}}" + PR_FIELDS
     orgs = " ".join(f"org:{o}" for o in ORGS)
-    filters = (f"author:{me}", f"review-requested:{me}", f"reviewed-by:{me} -author:{me}")
+    # review-requested also matches requests to my teams; user-review-requested only those to me
+    filters = (f"author:{me}", f"user-review-requested:{me}", f"reviewed-by:{me} -author:{me}", f"review-requested:{me}")
     with ThreadPoolExecutor() as pool:  # each search is a separate gh call, ~2-4s each
-        results = pool.map(lambda f: gql(q, q=f"is:pr is:open {orgs} {f}")["search"]["nodes"], filters)
-    return {n["id"]: n for nodes in results for n in nodes}
+        results = list(pool.map(lambda f: gql(q, q=f"is:pr is:open {orgs} {f}")["search"]["nodes"], filters))
+    live = {n["id"]: n for nodes in results for n in nodes}
+    personal = {n["id"] for nodes in results[:-1] for n in nodes}
+    return live, set(live) - personal  # second: PRs that involve me only via a team request
 
 
 WORDING = 3  # bump when status texts change; the next sync logs the rewording as hidden 'reworded' lines
@@ -183,6 +187,17 @@ def last_wording():
 def visible(e):
     """Log events worth showing as a change (not heartbeats, not pure rewording)."""
     return e["ev"] != "sync" and e["f"].get("type") not in ("reworded", "backfill", "CI started")  # pushes start CI
+
+
+def hidden_ids():
+    """PRs to hide while team requests are toggled off: their last logged 'team' flag is set (gone PRs too)."""
+    team = {}
+    if not TEAMS and os.path.exists(LOG):
+        for line in open(LOG):
+            e = json.loads(line)
+            if "team" in e.get("f", {}):
+                team[e["id"]] = e["f"]["team"]
+    return {pid for pid, t in team.items() if t}
 
 
 def replay():
@@ -202,15 +217,15 @@ def replay():
 
 def sync():
     me = os.environ.get("PRS_ME") or gql("{viewer{login}}")["viewer"]["login"]
-    live = fetch(me)
+    live, team = fetch(me)
     with open(LOG, "a") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)  # live view, /prs and the monitor may sync at the same time
-        out = diff_live(me, live)
+        out = diff_live(me, live, team)
         fh.writelines(json.dumps(e) + "\n" for e in out)
     return out[:-1]
 
 
-def diff_live(me, live):
+def diff_live(me, live, team=()):
     """Log events that turn the replayed board into the live one. Caller holds the log lock."""
     board, _ = replay()
     reword = last_wording() != WORDING
@@ -220,7 +235,7 @@ def diff_live(me, live):
         ev = events(pr)
         snap = {"title": pr["title"], "url": pr["url"], "role": role, "wait": wait, "why": why,
                 "at": ev[-1][0] if ev else pr["updatedAt"],  # last human activity
-                "issue": linked_issue(pr), "author": pr["author"]["login"], "ci": ci_state(pr)}
+                "issue": linked_issue(pr), "author": pr["author"]["login"], "ci": ci_state(pr), "team": pid in team}
         old = board.get(pid, {})
         if pr["mergeable"] == "UNKNOWN" and old.get("why") == CONFLICT_WHY:  # GitHub still recomputing: no flip
             snap["wait"], snap["why"] = old["wait"], old["why"]
@@ -390,7 +405,7 @@ def show(live=False):
     board, last = replay()
     free = shutil.get_terminal_size().columns - 84  # 82 before the title, 2 between title and issue
     tw, iw = (max(20, free * 3 // 5), max(20, free - max(20, free * 3 // 5))) if live else (50, 35)  # title gets more
-    rows = sorted(board.values(), key=lambda r: r["at"], reverse=True)  # newest activity first
+    rows = sorted((r for r in board.values() if TEAMS or not r.get("team")), key=lambda r: r["at"], reverse=True)
     me = [r for r in rows if r["wait"] == "ME"]
     them = [r for r in rows if r["wait"] == "THEM"]
     # distinct colors per issue; sorted keys keep them stable while the set of issues is unchanged
@@ -500,6 +515,25 @@ def test():
     assert issue_text({**iss, "more": 1}, 60).endswith("toggle (+1)")
     assert change_type(True, {"issue": 1}, [], {**snap, "issue": iss}, {}) == "linked"
     checks += 4
+    global LOG, TEAMS
+    saved = LOG, TEAMS
+    try:
+        LOG = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"prs-test-{os.getpid()}.jsonl")
+        p = {**pr("bob", reqs=["team-x"]), "title": "t", "url": "u", "updatedAt": now(), "number": 1,
+             "repository": {"nameWithOwner": "o/r"}, "closingIssuesReferences": {"totalCount": 0, "nodes": []}}
+        with open(LOG, "w") as fh:
+            fh.writelines(json.dumps(e) + "\n" for e in diff_live(me, {"a": p, "b": p}, {"a"}))
+        TEAMS = False
+        assert hidden_ids() == {"a"}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            show()
+        assert out.getvalue().count("r#1") == 1, out.getvalue()
+        TEAMS = True
+        assert hidden_ids() == set()
+        checks += 2
+    finally:
+        os.remove(LOG)
+        LOG, TEAMS = saved
     print(f"ok {len(cases)} status cases + {checks} helper checks")
 
 if __name__ == "__main__":
@@ -511,11 +545,14 @@ if __name__ == "__main__":
     elif cmd == "log":
         lines = [json.loads(l) for l in open(LOG)] if os.path.exists(LOG) else []
         print(CHANGE_COLS)
-        for e in sorted([e for e in lines if visible(e)][-int(sys.argv[2] if len(sys.argv) > 2 else 20):], key=when, reverse=True):
+        hide = hidden_ids()
+        for e in sorted([e for e in lines if visible(e) and e["id"] not in hide][-int(sys.argv[2] if len(sys.argv) > 2 else 20):], key=when, reverse=True):
             print(fmt_change(e))
     elif cmd == "sync":
-        for e in filter(visible, sync()):
-            print(fmt_change(e))
+        changes, hide = sync(), hidden_ids()
+        for e in changes:
+            if visible(e) and e["id"] not in hide:
+                print(fmt_change(e))
     elif cmd == "once" or not sys.stdout.isatty():  # piped / /prs skill: one shot
         # reuse the last sync by anyone (e.g. a live view) unless it is older than PRS_MAX_AGE minutes
         _, last = replay()
@@ -531,17 +568,24 @@ if __name__ == "__main__":
                 print("\n" + paint("RECENT CHANGES", "1"))
                 print("  " + dim(CHANGE_COLS, True))
                 lines = open(LOG).readlines() if os.path.exists(LOG) else []
-                changes = [e for e in map(json.loads, lines) if visible(e)]
+                hide = hidden_ids()
+                changes = [e for e in map(json.loads, lines) if visible(e) and e["id"] not in hide]
                 urls = {e["id"]: e["f"]["url"] for e in changes if "url" in e["f"]}  # also covers gone PRs
                 for e in sorted(changes[-10:], key=when, reverse=True):  # last 10, newest first
                     print("  " + fmt_change(e, urls))
-                print(f"\n{synced_text(replay()[1])} · {status} · Ctrl-C to quit")
+                teams = paint("on", "1;32") if TEAMS else paint("off (only requests to you)", "1;33")  # green / yellow
+                print(f"\n{synced_text(replay()[1])} · {status}, Enter to sync now · team requests: {teams}, t to toggle · Ctrl-C to quit")
             # overwrite in place: home, each line cleared to its end, then clear below (no scrollback growth)
             screen = buf.getvalue().rstrip("\n")  # no newline after the footer: it would leave an empty last line
             sys.stdout.write("\033[H" + screen.replace("\n", "\033[K\n") + "\033[K\033[J")
             sys.stdout.flush()
 
         sys.stdout.write("\033[?1049h\033[?25l")  # alternate screen like top/less, hide cursor
+        keys = sys.stdin.isatty()
+        if keys:  # read single keypresses without Enter; Ctrl-C still interrupts
+            import select, termios, tty
+            tty_saved = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin)
         try:
             _, last = replay()  # reuse a sync younger than one interval, e.g. from another live view
             err, next_sync = None, (time.time() - secs_since(last) + interval) if last else 0
@@ -549,6 +593,8 @@ if __name__ == "__main__":
             started = os.path.getmtime(src)
             while True:
                 if os.path.getmtime(src) != started:  # script was edited: restart on the new code
+                    if keys:
+                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, tty_saved)
                     os.execv(sys.executable, [sys.executable, src] + sys.argv[1:])
                 if time.time() >= next_sync:
                     render("syncing with GitHub…")  # last known board shows instantly while gh runs
@@ -561,9 +607,20 @@ if __name__ == "__main__":
                 wait_s = int(next_sync - time.time())
                 render(f"sync failed, retry in {wait_s}s: {str(err)[:60]}" if err
                        else f"next sync in {wait_s}s (every {interval}s)")
-                time.sleep(5)  # redraw from the log every 5s so the ages tick
+                # redraw from the log every 5s so the ages tick, or at once on a keypress
+                if keys and select.select([sys.stdin], [], [], 5)[0]:
+                    key = os.read(sys.stdin.fileno(), 1)
+                    if key in (b"\n", b"\r"):  # Enter: sync now
+                        next_sync = 0
+                    elif key in (b"t", b"T"):  # display filter only: no re-sync
+                        TEAMS = not TEAMS
+                        os.environ["PRS_TEAM_REVIEWS"] = "1" if TEAMS else "0"  # survives a restart on edit
+                elif not keys:
+                    time.sleep(5)
         except KeyboardInterrupt:
             pass
         finally:  # back to the normal screen, exactly as it was before prs started
+            if keys:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, tty_saved)
             sys.stdout.write("\033[?25h\033[?1049l")
             sys.stdout.flush()

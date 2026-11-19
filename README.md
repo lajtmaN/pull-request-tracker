@@ -65,6 +65,7 @@ PRS_STRIP_PREFIX=my-org-     # strip a shared repo-name prefix in the PR column
 PRS_INTERVAL=60              # live view: seconds between syncs
 PRS_MAX_AGE=30               # `prs once`: minutes before a saved sync counts as stale
 PRS_ME=my-login              # whose PRs to track (default: the `gh` account)
+PRS_TEAM_REVIEWS=0           # hide PRs only requested from your teams (default 1: show; live view: press t)
 ```
 
 ## How it works
