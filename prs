@@ -35,7 +35,7 @@ TEAMS = os.environ.get("PRS_TEAM_REVIEWS", "1") != "0"  # 0: hide PRs that only 
 
 PR_FIELDS = """
 fragment F on PullRequest {
-  id number title url updatedAt isDraft state mergeable reviewDecision
+  id number title url updatedAt isDraft state mergeable mergeStateStatus reviewDecision
   repository { nameWithOwner }
   author { __typename login }
   closingIssuesReferences(first: 3) { totalCount nodes { number title url repository { name } } }
@@ -55,11 +55,31 @@ fragment F on PullRequest {
 }"""
 
 
+class SyncError(Exception):
+    """A failed GitHub call, with a short human message (rate limits named as such)."""
+
+
+def sync_error(stderr):
+    err = (stderr or "").strip().splitlines()[-1:] or ["unknown error"]
+    if "rate limit" not in stderr.lower():
+        return SyncError(err[0].removeprefix("gh: ")[:100])
+    try:  # the hourly quota; when it isn't spent, GitHub's short secondary limit is what refused us
+        q = json.loads(subprocess.run(["gh", "api", "rate_limit"], capture_output=True, text=True).stdout)["resources"]["graphql"]
+        reset = time.strftime("%H:%M", time.localtime(q["reset"]))
+        return SyncError(f"GitHub rate limit: hourly quota spent, resets {reset}" if q["remaining"] < 50
+                         else f"GitHub rate limit (short-term secondary limit; hourly quota {q['remaining']}/{q['limit']} left)")
+    except Exception:
+        return SyncError("GitHub rate limit")
+
+
 def gql(query, **vars):
     args = ["gh", "api", "graphql", "-f", f"query={query}"]
     for k, v in vars.items():
         args += [x for i in v for x in ("-f", f"{k}[]={i}")] if isinstance(v, list) else ["-f", f"{k}={v}"]
-    return json.loads(subprocess.run(args, capture_output=True, text=True, check=True).stdout)["data"]
+    r = subprocess.run(args, capture_output=True, text=True)
+    if r.returncode:
+        raise sync_error(r.stderr + r.stdout)
+    return json.loads(r.stdout)["data"]
 
 
 def now():
@@ -119,7 +139,14 @@ def status(pr, me):
         approvers = [who for who, v in verdicts.items() if v == "APPROVED"]
         if pr["reviewDecision"] == "APPROVED" or (  # repos without required reviews have no decision
                 pr["reviewDecision"] is None and approvers and "CHANGES_REQUESTED" not in verdicts.values()):
-            return "A", "ME", f"merge (approved by {', '.join(approvers)})" if approvers else "merge (approved)"
+            # Approval matters most; open threads (usually nits) that block the merge are only a note.
+            blocked = pr.get("mergeStateStatus") == "BLOCKED"
+            n = sum(not t["isResolved"] for t in (pr.get("reviewThreads") or {}).get("nodes", []))
+            if blocked and not n and "reviewThreads" in pr and checks == "SUCCESS":  # a branch rule wants another review
+                by = f"approved by {', '.join(approvers)}" if approvers else "approved"
+                return "A", "THEM", f"{', '.join(pending) or 'another reviewer'} to review ({by})"
+            note = f"; {n} open thread{'s' * (n != 1)}" if n and blocked else ""
+            return "A", "ME", (f"merge (approved by {', '.join(approvers)}{note})" if approvers else f"merge (approved{note})")
         if talk and talk[-1][1] != me:
             _, who, kind, st, _ = talk[-1]
             if st == "CHANGES_REQUESTED":
@@ -144,6 +171,15 @@ def status(pr, me):
     return "R", "THEM", {"APPROVED": f"{author} to merge (you approved)",
                          "CHANGES_REQUESTED": f"{author} to address your review",
                          "COMMENTED": f"{author} to reply to you"}.get(verdict, f"{author} to act (not your review)")
+
+
+def stage(pr, me, why):
+    """Review stage for viewers: 'ready' (approved, nothing red; open threads allowed), 'inreview' (a human
+    other than the author reviewed), else 'awaiting'. ponytail: sees the last 40 timeline items only."""
+    if why.startswith("merge") or why.startswith(f"{pr['author']['login']} to merge"):
+        return "ready"
+    author = pr["author"]["login"]
+    return "inreview" if any(e[2] == "review" and e[1] not in (author,) for e in events(pr)) else "awaiting"
 
 
 def linked_issue(pr):
@@ -171,6 +207,14 @@ def fetch(me):
     with ThreadPoolExecutor() as pool:  # each search is a separate gh call, ~2-4s each
         results = list(pool.map(lambda f: gql(q, q=f"is:pr is:open {orgs} {f}")["search"]["nodes"], filters))
     live = {n["id"]: n for nodes in results for n in nodes}
+    # Threads only where they can matter (my PR, merge BLOCKED): in the bulk search they multiply its cost.
+    blocked = [i for i, n in live.items() if n["author"]["login"] == me and n.get("mergeStateStatus") == "BLOCKED"
+               and n["reviewDecision"] in ("APPROVED", None)]
+    if blocked:
+        q2 = ("query($ids:[ID!]!){nodes(ids:$ids){...on PullRequest{id reviewThreads(first:50){nodes{isResolved "
+              "comments(first:1){nodes{author{login}}}}}}}}")
+        for n in gql(q2, ids=blocked)["nodes"]:
+            live[n["id"]]["reviewThreads"] = n["reviewThreads"]
     personal = {n["id"] for nodes in results[:-1] for n in nodes}
     return live, set(live) - personal  # second: PRs that involve me only via a team request
 
@@ -215,9 +259,22 @@ def replay():
     return board, last_sync
 
 
+ERR = os.path.join(HERE, "sync-error.txt")  # the last sync's failure; gone after a good sync
+
+
+def last_error():
+    return open(ERR).read().strip() if os.path.exists(ERR) else None
+
+
 def sync():
-    me = os.environ.get("PRS_ME") or gql("{viewer{login}}")["viewer"]["login"]
-    live, team = fetch(me)
+    try:
+        me = os.environ.get("PRS_ME") or gql("{viewer{login}}")["viewer"]["login"]
+        live, team = fetch(me)
+    except SyncError as ex:
+        open(ERR, "w").write(f"{now()} {ex}\n")
+        raise
+    if os.path.exists(ERR):
+        os.remove(ERR)
     with open(LOG, "a") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)  # live view, /prs and the monitor may sync at the same time
         out = diff_live(me, live, team)
@@ -235,7 +292,8 @@ def diff_live(me, live, team=()):
         ev = events(pr)
         snap = {"title": pr["title"], "url": pr["url"], "role": role, "wait": wait, "why": why,
                 "at": ev[-1][0] if ev else pr["updatedAt"],  # last human activity
-                "issue": linked_issue(pr), "author": pr["author"]["login"], "ci": ci_state(pr), "team": pid in team}
+                "issue": linked_issue(pr), "author": pr["author"]["login"], "ci": ci_state(pr), "team": pid in team,
+                "stage": stage(pr, me, why), "draft": pr["isDraft"]}
         old = board.get(pid, {})
         if pr["mergeable"] == "UNKNOWN" and old.get("why") == CONFLICT_WHY:  # GitHub still recomputing: no flip
             snap["wait"], snap["why"] = old["wait"], old["why"]
@@ -432,11 +490,14 @@ def show(live=False):
             print(f"  {link(r['url'], row)}  {link((issue or {}).get('url'), itext)}" if live
                   else f"  {row}  {itext}".rstrip())
     if not live:  # the live view puts this in its footer
-        print(f"\n{synced_text(last)}")
+        print(f"\n{synced_text(last, live)}")
 
 
-def synced_text(last):
-    return f"synced {age(last) + ' ago' if last else 'never'}"
+def synced_text(last, live=False):
+    """'synced 2m ago', plus the last sync's failure in red when it failed."""
+    text = f"synced {age(last) + ' ago' if last else 'never'}"
+    err = last_error()
+    return text + (" · " + paint(f"sync failed: {err.split(' ', 1)[1]}", "1;31", live) if err else "")
 
 def test():
     me = "me"
@@ -454,6 +515,12 @@ def test():
         (pr(checks="FAILURE", reqs=["x"]), ("A", "ME", "fix failing CI")),
         (pr(mergeable="CONFLICTING"), ("A", "ME", "resolve conflict")),
         (pr(decision="APPROVED"), ("A", "ME", "merge (approved)")),
+        (dict(pr(decision="APPROVED"), mergeStateStatus="BLOCKED", reviewThreads={"nodes": [
+            {"isResolved": False, "comments": {"nodes": [{"author": {"login": "x"}}]}},
+            {"isResolved": True, "comments": {"nodes": [{"author": {"login": "y"}}]}}]}),
+         ("A", "ME", "merge (approved; 1 open thread)")),
+        (dict(pr(decision="APPROVED", reqs=["y"]), mergeStateStatus="BLOCKED", reviewThreads={"nodes": []}),
+         ("A", "THEM", "y to review (approved)")),
         (pr(tl=[push("1", "me")]), ("A", "ME", "request review")),
         (pr(tl=[push("1", "me"), rev("2", "x", "APPROVED")]), ("A", "ME", "merge (approved by x)")),
         (pr(decision="REVIEW_REQUIRED", reqs=["y"], tl=[push("1", "me"), rev("2", "x", "APPROVED"), push("3", "me")]),
@@ -505,6 +572,10 @@ def test():
     ev["f"].update(wait="ME", why=CI_WHY, type="CI failed", by="github")
     assert fmt_change(ev).endswith("CI failed    github         you to fix failing CI"), fmt_change(ev)
     checks += 2
+    assert stage(pr(tl=[rev("2", "x", "COMMENTED")]), me, "x to re-review") == "inreview"
+    assert stage(pr(tl=[push("1", "me")]), me, "request review") == "awaiting"
+    assert stage(pr(), me, "merge (approved by x; 2 open threads)") == "ready"
+    assert stage(pr("bob"), me, "bob to merge (you approved)") == "ready"
     for why, want in [("merge (approved by x)", "merge"), ("bob to merge (you approved)", "bob to merge"),
                       ("review (asked by bob)", "review"), ("re-review (bob pushed)", "re-review"),
                       ("x, y to review", "x, y to review"), ("address changes from x", "address changes from x")]:
@@ -557,7 +628,10 @@ if __name__ == "__main__":
         # reuse the last sync by anyone (e.g. a live view) unless it is older than PRS_MAX_AGE minutes
         _, last = replay()
         if "--force" in sys.argv or not last or secs_since(last) > 60 * int(os.environ.get("PRS_MAX_AGE", "30")):
-            sync()
+            try:
+                sync()
+            except SyncError:
+                pass  # show() prints the last board with the error in red under it
         show()
     else:  # terminal: live board like top, Ctrl-C to quit
         interval = int(os.environ.get("PRS_INTERVAL", "60"))
@@ -574,7 +648,7 @@ if __name__ == "__main__":
                 for e in sorted(changes[-10:], key=when, reverse=True):  # last 10, newest first
                     print("  " + fmt_change(e, urls))
                 teams = paint("on", "1;32") if TEAMS else paint("off (only requests to you)", "1;33")  # green / yellow
-                print(f"\n{synced_text(replay()[1])} · {status}, Enter to sync now · team requests: {teams}, t to toggle · Ctrl-C to quit")
+                print(f"\n{synced_text(replay()[1], live=True)} · {status}, Enter to sync now · team requests: {teams}, t to toggle · Ctrl-C to quit")
             # overwrite in place: home, each line cleared to its end, then clear below (no scrollback growth)
             screen = buf.getvalue().rstrip("\n")  # no newline after the footer: it would leave an empty last line
             sys.stdout.write("\033[H" + screen.replace("\n", "\033[K\n") + "\033[K\033[J")
@@ -601,12 +675,13 @@ if __name__ == "__main__":
                     try:
                         sync()
                         err = None
-                    except Exception as ex:  # network blip: keep showing the last known board
+                    except Exception as ex:  # rate limit / network blip: keep showing the last known board
                         err = ex
+                        if not isinstance(ex, SyncError):  # sync() records its own; record the rest too
+                            open(ERR, "w").write(f"{now()} {str(ex)[:100]}\n")
                     next_sync = time.time() + interval
                 wait_s = int(next_sync - time.time())
-                render(f"sync failed, retry in {wait_s}s: {str(err)[:60]}" if err
-                       else f"next sync in {wait_s}s (every {interval}s)")
+                render(f"retry in {wait_s}s" if err else f"next sync in {wait_s}s (every {interval}s)")
                 # redraw from the log every 5s so the ages tick, or at once on a keypress
                 if keys and select.select([sys.stdin], [], [], 5)[0]:
                     key = os.read(sys.stdin.fileno(), 1)

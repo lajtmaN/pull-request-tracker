@@ -7,9 +7,11 @@ review was requested from them or they have reviewed. Settings live in the git-i
 ## Files
 - `prs` — the CLI (symlink it onto your PATH). Bare `prs` = live board. `once`, `show` (offline), `sync`, `log [N]`, `test`.
 - `log.jsonl` — append-only change log, the **source of truth**. One JSON object per line:
-  - `{"ev":"set","id","key","ts","f":{changed fields}}` fields: title url role wait why at issue author ci team type by link (type = kind of change, link = the review/comment that caused it, team = only a team review request involves me)
+  - `{"ev":"set","id","key","ts","f":{changed fields}}` fields: title url role wait why at issue author ci team stage draft type by link
+    (stage = awaiting | inreview | ready, for viewers such as the daily brief's PR groups; draft = isDraft) (type = kind of change, link = the review/comment that caused it, team = only a team review request involves me)
   - `{"ev":"gone","id","key","ts","f":{"why":"merged|closed|untracked"}}`
   - `{"ev":"sync","ts","n"}` heartbeat
+- `sync-error.txt` — the last failed sync (`<ts> <message>`, rate limits named, e.g. "GitHub rate limit (short-term secondary limit; …)"); removed by the next good sync. The board shows it in red after "synced … ago"; the brief's local PR page shows it too. Git-ignored.
   The board is a replay of this log. Never edit or truncate it by hand unless the user explicitly asks
   (then back it up first and rewrite under the log's flock). To restore after
   a lost session or in the morning, just run `prs`: it replays the log and syncs.
@@ -25,7 +27,7 @@ STATUS text: under YOUR MOVE an instruction to the user, under THEIR MOVE "<who>
 parentheses so `next_step()` can strip them. Role internally: A = the user authored it, R = they review it.
 Author (A), first match wins: draft → ME "finish draft" · conflict → ME "resolve conflict" ·
 CI red → ME "fix failing CI" · approved (or, without required reviews, an approval and no open
-changes-requested) → ME "merge (approved by X)" · last review/comment/push by someone else → ME
+changes-requested) → ME "merge (approved by X)", with "; N open threads" added inside the parentheses when unresolved review threads block the merge · last review/comment/push by someone else → ME
 "address changes from X" / "reply to X" / "check commits from X" · pending reviewers → THEM "X to review" ·
 earlier feedback answered, nobody requested → THEM "X to re-review" · else ME "request review".
 Reviewer (R): draft → THEM "bob to finish draft" · requested → ME "review (asked by bob)" ·
