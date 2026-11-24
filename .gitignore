@@ -4,3 +4,4 @@ log.jsonl.bak-*
 .env
 
 __pycache__/
+sync-error.txt
