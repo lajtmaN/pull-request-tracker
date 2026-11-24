@@ -59,8 +59,14 @@ class SyncError(Exception):
     """A failed GitHub call, with a short human message (rate limits named as such)."""
 
 
+GATEWAY = re.compile(r"<title>\s*(50[234][^<]*)</title>|HTTP (50[234])")
+
+
 def sync_error(stderr):
     err = (stderr or "").strip().splitlines()[-1:] or ["unknown error"]
+    m = GATEWAY.search(stderr or "")
+    if m:  # GitHub sends an HTML error page when a heavy query times out on its side
+        return SyncError(f"GitHub {(m.group(1) or m.group(2)).strip()} (its servers timed out; usually passes on the next try)")
     if "rate limit" not in stderr.lower():
         return SyncError(err[0].removeprefix("gh: ")[:100])
     try:  # the hourly quota; when it isn't spent, GitHub's short secondary limit is what refused us
@@ -76,7 +82,11 @@ def gql(query, **vars):
     args = ["gh", "api", "graphql", "-f", f"query={query}"]
     for k, v in vars.items():
         args += [x for i in v for x in ("-f", f"{k}[]={i}")] if isinstance(v, list) else ["-f", f"{k}={v}"]
-    r = subprocess.run(args, capture_output=True, text=True)
+    for attempt in range(3):  # a heavy search can hit a GitHub-side 502/504; it usually passes on a retry
+        r = subprocess.run(args, capture_output=True, text=True)
+        if not r.returncode or not GATEWAY.search(r.stderr + r.stdout) or attempt == 2:
+            break
+        time.sleep(2 * (attempt + 1))
     if r.returncode:
         raise sync_error(r.stderr + r.stdout)
     return json.loads(r.stdout)["data"]
@@ -510,6 +520,8 @@ def test():
     push = lambda t, who: {"__typename": "PullRequestCommit", "commit": {"committedDate": t, "author": {"user": {"login": who}}}}
     rev = lambda t, who, st: {"__typename": "PullRequestReview", "submittedAt": t, "state": st, "author": {"__typename": "User", "login": who}}
     com = lambda t, who, typ="User": {"__typename": "IssueComment", "createdAt": t, "author": {"__typename": typ, "login": who}}
+    assert "502 Bad Gateway" in str(sync_error("<html>\n<head><title>502 Bad Gateway</title></head>\n</html>"))
+    assert str(sync_error("gh: Could not resolve host: api.github.com")) == "Could not resolve host: api.github.com"
     cases = [
         (pr(draft=True), ("A", "ME", "finish draft")),
         (pr(checks="FAILURE", reqs=["x"]), ("A", "ME", "fix failing CI")),
